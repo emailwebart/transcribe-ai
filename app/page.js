@@ -411,7 +411,9 @@ function UploadScreen({ supabase, user, onUploadComplete, onCancel }) {
     let rejectedCount = 0;
 
     selectedFiles.forEach(file => {
-      if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
+      const isMedia = file.type.startsWith('audio/') || file.type.startsWith('video/');
+      const FIFTY_MB = 50 * 1024 * 1024;
+      if (isMedia && file.size <= FIFTY_MB) {
         validQueueItems.push({
           id: `${file.name}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
           file: file,
@@ -427,7 +429,7 @@ function UploadScreen({ supabase, user, onUploadComplete, onCancel }) {
     });
 
     if (rejectedCount > 0) {
-      setErrorMsg(`${rejectedCount} file(s) skipped. Please select valid audio or video files.`);
+      setErrorMsg(`${rejectedCount} file(s) skipped. Files must be valid audio or video and under 50MB.`);
     } else {
       setErrorMsg('');
     }
@@ -446,51 +448,111 @@ function UploadScreen({ supabase, user, onUploadComplete, onCancel }) {
     setIsUploading(true);
     setErrorMsg('');
 
-    // Mark all files as processing/queued to start
-    setFiles(prev => prev.map(f => ({ ...f, status: 'processing', progress: 'Connecting...' })));
+    // Mark all files as processing to start
+    setFiles(prev => prev.map(f => ({ ...f, status: 'processing', progress: 'Starting upload...' })));
 
-    // Upload & Transcribe each file concurrently
+    // Process each file
     const promises = files.map(async (fileItem) => {
+      let dbRecord = null;
       try {
-        const { data: { session } } = await supabase.auth.getSession();
-        const token = session?.access_token;
+        const fileExt = fileItem.file.name.split('.').pop();
+        const storageFileName = `${user.id}/${Date.now()}.${fileExt}`;
 
-        // Custom status feedback for > 50MB files
-        const FIFTY_MB = 50 * 1024 * 1024;
-        let activeMsg = 'Uploading & transcribing...';
-        if (fileItem.size > FIFTY_MB) {
-          activeMsg = 'Large file detected. Compressing on server...';
+        // 1. Upload to Supabase Storage
+        setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, progress: 'Uploading to Supabase...' } : f));
+        const { error: uploadError } = await supabase.storage
+          .from('audio-uploads')
+          .upload(storageFileName, fileItem.file);
+
+        if (uploadError) {
+          throw new Error(`Storage Upload Failed: ${uploadError.message}`);
         }
 
-        setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, progress: activeMsg } : f));
+        // 2. Get Public URL
+        const { data: { publicUrl } } = supabase.storage
+          .from('audio-uploads')
+          .getPublicUrl(storageFileName);
 
-        const response = await fetch('/api/upload', {
+        // 3. Create initial database record in 'processing' status
+        setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, progress: 'Creating database entry...' } : f));
+        const { data: insertedRecord, error: dbError } = await supabase
+          .from('transcriptions')
+          .insert([{
+            user_id: user.id,
+            title: fileItem.file.name,
+            audio_url: publicUrl,
+            status: 'processing'
+          }])
+          .select()
+          .single();
+
+        if (dbError) {
+          throw new Error(`Database Insert Failed: ${dbError.message}`);
+        }
+
+        dbRecord = insertedRecord;
+
+        // 4. Call Deepgram API (via next.js secure API route)
+        setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, progress: 'Deepgram is transcribing...' } : f));
+        const response = await fetch('/api/transcribe', {
           method: 'POST',
-          headers: {
-            'Authorization': token ? `Bearer ${token}` : '',
-            'Content-Type': fileItem.file.type || 'application/octet-stream',
-            'x-file-name': encodeURIComponent(fileItem.name),
-            'x-user-id': user.id
-          },
-          body: fileItem.file
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audioUrl: publicUrl })
         });
 
         if (!response.ok) {
-          const errBody = await response.json();
-          throw new Error(errBody.error || 'Failed to process transcription');
+          const errData = await response.json();
+          throw new Error(errData.error || 'Deepgram API error');
         }
 
-        const data = await response.json();
+        const dgResult = await response.json();
+
+        // Parse transcript text
+        let finalTranscript = 'No text detected.';
+        if (dgResult.results?.channels?.length > 0) {
+          const paragraphs = dgResult.results.channels[0].alternatives[0].paragraphs;
+          if (paragraphs) {
+            finalTranscript = paragraphs.transcript;
+          } else {
+            finalTranscript = dgResult.results.channels[0].alternatives[0].transcript;
+          }
+        }
+
+        // 5. Update Database with Success status and transcript text
+        setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, progress: 'Saving results...' } : f));
+        const { data: finalRecord, error: updateError } = await supabase
+          .from('transcriptions')
+          .update({ transcript_text: finalTranscript, status: 'completed' })
+          .eq('id', dbRecord.id)
+          .select()
+          .single();
+
+        if (updateError) {
+          throw new Error(`Final Database Update Failed: ${updateError.message}`);
+        }
 
         setFiles(prev => prev.map(f => f.id === fileItem.id ? { 
           ...f, 
           status: 'completed', 
           progress: 'Completed',
-          completedRecord: data
+          completedRecord: finalRecord
         } : f));
 
       } catch (err) {
         console.error(`Error processing ${fileItem.name}:`, err);
+        
+        // Mark database record as failed if it was created
+        if (dbRecord?.id) {
+          try {
+            await supabase
+              .from('transcriptions')
+              .update({ status: 'failed', transcript_text: `Error: ${err.message}` })
+              .eq('id', dbRecord.id);
+          } catch (dbErr) {
+            console.error('Failed to update transcription status to failed:', dbErr);
+          }
+        }
+
         setFiles(prev => prev.map(f => f.id === fileItem.id ? { 
           ...f, 
           status: 'failed', 
@@ -509,7 +571,7 @@ function UploadScreen({ supabase, user, onUploadComplete, onCancel }) {
         <button onClick={onCancel} className="mr-4 text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-100 rounded-full"><ChevronLeft size={24} /></button>
         <div>
           <h1 className="text-2xl font-bold text-slate-900">Upload Media</h1>
-          <p className="text-slate-500 text-sm mt-1">Upload multiple audio/video files. Files larger than 50MB will be auto-compressed.</p>
+          <p className="text-slate-500 text-sm mt-1">Upload multiple audio/video files. Max file size: 50MB.</p>
         </div>
       </div>
 
