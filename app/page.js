@@ -452,10 +452,6 @@ function UploadScreen({ supabase, user, onUploadComplete, onCancel }) {
     // Upload & Transcribe each file concurrently
     const promises = files.map(async (fileItem) => {
       try {
-        const formData = new FormData();
-        formData.append('file', fileItem.file);
-        formData.append('userId', user.id);
-
         const { data: { session } } = await supabase.auth.getSession();
         const token = session?.access_token;
 
@@ -471,9 +467,12 @@ function UploadScreen({ supabase, user, onUploadComplete, onCancel }) {
         const response = await fetch('/api/upload', {
           method: 'POST',
           headers: {
-            'Authorization': token ? `Bearer ${token}` : ''
+            'Authorization': token ? `Bearer ${token}` : '',
+            'Content-Type': fileItem.file.type || 'application/octet-stream',
+            'x-file-name': encodeURIComponent(fileItem.name),
+            'x-user-id': user.id
           },
-          body: formData
+          body: fileItem.file
         });
 
         if (!response.ok) {

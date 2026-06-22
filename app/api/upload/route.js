@@ -3,8 +3,9 @@ import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
+import { Readable } from 'stream';
+import { finished } from 'stream/promises';
 
-// Next.js App Router body size limit configuration (if needed)
 export const maxDuration = 300; // 5 minutes max duration for serverless functions
 
 const runCompression = (inputPath, outputPath) => {
@@ -37,12 +38,13 @@ export async function POST(request) {
   let dbRecordId = null;
 
   try {
-    const formData = await request.formData();
-    const file = formData.get('file');
-    const userId = formData.get('userId');
+    const userId = request.headers.get('x-user-id');
+    const originalFileName = decodeURIComponent(request.headers.get('x-file-name') || 'file');
+    const contentType = request.headers.get('content-type') || 'audio/mpeg';
+    const fileSize = parseInt(request.headers.get('content-length') || '0', 10);
 
-    if (!file || !userId) {
-      return NextResponse.json({ error: 'File and User ID are required' }, { status: 400 });
+    if (!userId || !originalFileName) {
+      return NextResponse.json({ error: 'User ID and File Name are required in headers' }, { status: 400 });
     }
 
     // Initialize Supabase Client using the client's Auth token to respect RLS
@@ -59,9 +61,7 @@ export async function POST(request) {
       }
     );
 
-    const originalFileName = file.name;
     const fileExt = originalFileName.split('.').pop();
-    const fileSize = file.size;
 
     // Define temp folder path
     const tempDir = path.join(process.cwd(), 'temp');
@@ -69,13 +69,14 @@ export async function POST(request) {
       fs.mkdirSync(tempDir, { recursive: true });
     }
 
-    // Convert file to buffer and write to temp input path
-    const buffer = Buffer.from(await file.arrayBuffer());
+    // Stream request body to temp input path
     const fileId = `${userId}_${Date.now()}`;
     tempInputPath = path.join(tempDir, `input_${fileId}.${fileExt}`);
-    fs.writeFileSync(tempInputPath, buffer);
+    
+    const writer = fs.createWriteStream(tempInputPath);
+    await finished(Readable.fromWeb(request.body).pipe(writer));
 
-    let uploadBuffer = buffer;
+    let uploadBuffer = fs.readFileSync(tempInputPath);
     let uploadFileName = `${userId}/${Date.now()}.${fileExt}`;
     let isCompressed = false;
 
@@ -99,7 +100,7 @@ export async function POST(request) {
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from('audio-uploads')
       .upload(uploadFileName, uploadBuffer, {
-        contentType: isCompressed ? 'audio/mpeg' : file.type,
+        contentType: isCompressed ? 'audio/mpeg' : contentType,
         duplex: 'half'
       });
 
