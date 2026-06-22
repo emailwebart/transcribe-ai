@@ -206,9 +206,13 @@ export default function App() {
             <UploadScreen 
               supabase={supabaseClient}
               user={session?.user}
-              onUploadComplete={() => {
+              onUploadComplete={(singleRecord) => {
                 fetchTranscriptions();
-                navigateTo('dashboard');
+                if (singleRecord) {
+                  navigateTo('detail', singleRecord);
+                } else {
+                  navigateTo('dashboard');
+                }
               }}
               onCancel={() => navigateTo('dashboard')}
             />
@@ -538,6 +542,8 @@ function UploadScreen({ supabase, user, onUploadComplete, onCancel }) {
           completedRecord: finalRecord
         } : f));
 
+        return finalRecord;
+
       } catch (err) {
         console.error(`Error processing ${fileItem.name}:`, err);
         
@@ -559,10 +565,20 @@ function UploadScreen({ supabase, user, onUploadComplete, onCancel }) {
           progress: 'Failed', 
           error: err.message 
         } : f));
+
+        return null;
       }
     });
 
-    await Promise.all(promises);
+    const results = await Promise.all(promises);
+    const completedRecords = results.filter(Boolean);
+
+    // Auto-navigate to detail view if a single file completed successfully
+    if (files.length === 1 && completedRecords.length === 1) {
+      setTimeout(() => {
+        onUploadComplete(completedRecords[0]);
+      }, 800);
+    }
   };
 
   return (
@@ -676,10 +692,17 @@ function UploadScreen({ supabase, user, onUploadComplete, onCancel }) {
           <div className="flex justify-center gap-3 border-t border-slate-100 pt-6">
             {files.every(f => f.status === 'completed' || f.status === 'failed') ? (
               <button 
-                onClick={onUploadComplete}
+                onClick={() => {
+                  const completedFiles = files.filter(f => f.status === 'completed');
+                  if (files.length === 1 && completedFiles.length === 1) {
+                    onUploadComplete(completedFiles[0].completedRecord);
+                  } else {
+                    onUploadComplete();
+                  }
+                }}
                 className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg shadow-sm transition-colors"
               >
-                Return to Dashboard
+                {files.length === 1 && files.filter(f => f.status === 'completed').length === 1 ? 'View Transcript' : 'Return to Dashboard'}
               </button>
             ) : (
               <div className="flex flex-col items-center gap-2">
